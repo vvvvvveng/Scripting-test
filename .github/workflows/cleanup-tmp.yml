@@ -1,0 +1,64 @@
+name: cleanup-tmp
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove expired tmp files
+        shell: bash
+        run: |
+          set -euo pipefail
+          TTL=$(cat tmp/.ttl 2>/dev/null || echo 1)
+          TTL_MS=$(( TTL * 60000 ))
+          remove_expired() {
+            now_ms=$(( $(date +%s) * 1000 ))
+            for f in tmp/*.scripting; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              ts=${name%%_*}
+              case "$ts" in
+                ''|*[!0-9]*) continue ;;
+              esac
+              age_ms=$(( now_ms - ts ))
+              if [ "$age_ms" -ge "$TTL_MS" ]; then
+                git rm -q "$f" || rm -f "$f"
+                echo "removed $f (age_ms=$age_ms, ttl_ms=$TTL_MS)"
+              fi
+            done
+          }
+          # 1) 先删掉已过期文件
+          remove_expired
+          # 2) 若还有未过期文件，算最早到期时刻，睡到点再删（到点即删，不依赖 cron 轮询）
+          now_ms=$(( $(date +%s) * 1000 ))
+          earliest=99999999999999
+          for f in tmp/*.scripting; do
+            [ -e "$f" ] || continue
+            name=$(basename "$f")
+            ts=${name%%_*}
+            case "$ts" in
+              ''|*[!0-9]*) continue ;;
+            esac
+            exp=$(( ts + TTL_MS ))
+            if [ "$exp" -gt "$now_ms" ] && [ "$exp" -lt "$earliest" ]; then
+              earliest=$exp
+            fi
+          done
+          if [ "$earliest" -ne 99999999999999 ]; then
+            sleep_s=$(( (earliest - now_ms) / 1000 + 1 ))
+            if [ "$sleep_s" -le 600 ]; then  # 最多睡 10 分钟，避免长时间占用 runner；更长的交给 cron 兜底
+              echo "sleeping ${sleep_s}s until first expiry"
+              sleep "$sleep_s"
+              remove_expired
+            fi
+          fi
+          git add -A
+          git diff --cached --quiet && exit 0
+          git -c user.name="script-manager-cleanup" -c user.email="actions@users.noreply.github.com" commit -m "chore: cleanup expired tmp share files"
+          git push
