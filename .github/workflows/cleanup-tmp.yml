@@ -5,12 +5,17 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: cleanup-tmp
+  cancel-in-progress: false
 jobs:
   cleanup:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Remove expired tmp files
         shell: bash
         run: |
@@ -60,5 +65,17 @@ jobs:
           fi
           git add -A
           git diff --cached --quiet && exit 0
-          git -c user.name="script-manager-cleanup" -c user.email="actions@users.noreply.github.com" commit -m "chore: cleanup expired tmp share files"
-          git push
+          # 提交并推送；并发/远程有更新时先拉取再重试（最多 3 次），避免 push 失败导致文件残留
+          for i in 1 2 3; do
+            if git -c user.name="script-manager-cleanup" -c user.email="actions@users.noreply.github.com" commit -m "chore: cleanup expired tmp share files"; then
+              :
+            fi
+            if git push; then
+              exit 0
+            fi
+            echo "push attempt $i failed, rebasing and retrying..."
+            sleep 5
+            git pull --rebase --autostash || true
+          done
+          echo "push failed after 3 attempts"
+          exit 1
